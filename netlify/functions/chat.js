@@ -1,12 +1,14 @@
 /* =========================================================================
-   ThermoData Chatbot - Netlify Function (OpenAI)
+   ThermoData Chatbot - Netlify Function (Gemini multi-model + retries)
    - Reçoit POST { messages: [...] } depuis les domaines autorisés
-   - Appelle l'API OpenAI (clé jamais exposée côté client)
+   - Appelle l'API Gemini (clé jamais exposée côté client)
    - CORS configuré pour autoriser thermodata.fr
-   - Si quota / crédit épuisé => renvoie le code HTTP au front pour fallback email
+   - Tente plusieurs modèles Gemini en cascade
+   - Retry automatique sur erreurs temporaires
+   - Si tous les modèles échouent => renvoie une erreur exploitable côté front
    ========================================================================= */
 
-// ⚠️ EDIT THIS : domaines autorisés à appeler la function
+// Domaines autorisés à appeler la function
 const ALLOWED_ORIGINS = [
   'https://thermodata.fr',
   'https://www.thermodata.fr',
@@ -15,11 +17,30 @@ const ALLOWED_ORIGINS = [
   'http://127.0.0.1:5500'
 ];
 
-// ⚠️ EDIT THIS : modèle OpenAI à utiliser
-// - 'gpt-4o-mini'  : rapide + très économique - recommandé pour un chat support
-// - 'gpt-4o'       : meilleure qualité (~10x plus cher)
-// - 'gpt-4.1-mini' : variante récente, cost/quality similaire à gpt-4o-mini
-const MODEL = 'gpt-4o-mini';
+/*
+  Ordre conseillé :
+  1) modèles les plus économiques / légers
+  2) modèles plus costauds ensuite
+
+  Remarque :
+  - Tous ne sont pas garantis gratuits en permanence
+  - Certains previews peuvent changer ou disparaître
+  - Le code continue même si un modèle n'est pas dispo
+*/
+const MODELS = [
+  'gemini-3.1-flash-lite-preview',
+  'gemini-2.5-flash-lite',
+  'gemini-2.5-flash'
+];
+
+const MAX_HISTORY_MESSAGES = 20;
+const MAX_MESSAGE_CHARS = 2000;
+const MAX_OUTPUT_TOKENS = 400;
+const TEMPERATURE = 0.4;
+
+const REQUEST_TIMEOUT_MS = 15000;
+const MAX_RETRIES_PER_MODEL = 2;
+const RETRY_BASE_DELAY_MS = 700;
 
 const SYSTEM_PROMPT = `Tu es l'assistant officiel de ThermoData (https://thermodata.fr), une plateforme française qui fournit des plans de prospection porte-à-porte aux artisans RGE (chauffagistes, isolateurs, énergéticiens) à partir des données DPE de l'ADEME.
 
@@ -44,7 +65,7 @@ DONNÉES :
 RÈGLES :
 - Réponds en français, ton professionnel mais chaleureux
 - Maximum 3-4 phrases courtes
-- Si tu ne sais pas, ou question commerciale spécifique (devis, partenariat, remboursement, délai) → redirige vers contact@thermodata.fr
+- Si tu ne sais pas, ou question commerciale spécifique (devis, partenariat, remboursement, délai) -> redirige vers contact@thermodata.fr
 - Ne promets jamais de délais, remboursements ou partenariats sans validation
 - N'invente jamais de fonctionnalités ou de chiffres
 - Si la question est hors-sujet (politique, perso, etc.), recadre poliment vers ThermoData`;
@@ -54,83 +75,240 @@ exports.handler = async (event) => {
   const allowOrigin = ALLOWED_ORIGINS.includes(origin) ? origin : ALLOWED_ORIGINS[0];
 
   if (event.httpMethod === 'OPTIONS') {
-    return { statusCode: 204, headers: corsHeaders(allowOrigin), body: '' };
+    return {
+      statusCode: 204,
+      headers: corsHeaders(allowOrigin),
+      body: ''
+    };
   }
 
   if (event.httpMethod !== 'POST') {
     return reply(405, { error: 'method_not_allowed' }, allowOrigin);
   }
 
-  const apiKey = process.env.OPENAI_API_KEY;
+  const apiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
   if (!apiKey) {
-    console.error('OPENAI_API_KEY not set');
+    console.error('Missing GEMINI_API_KEY / GOOGLE_API_KEY');
     return reply(503, { error: 'config_missing' }, allowOrigin);
   }
 
-  // Parse body
   let userMessages;
   try {
     const body = JSON.parse(event.body || '{}');
     userMessages = body.messages;
+
     if (!Array.isArray(userMessages) || userMessages.length === 0) {
       return reply(400, { error: 'messages_required' }, allowOrigin);
     }
-    if (userMessages.length > 20) userMessages = userMessages.slice(-20);
-    userMessages = userMessages.map(m => ({
+
+    if (userMessages.length > MAX_HISTORY_MESSAGES) {
+      userMessages = userMessages.slice(-MAX_HISTORY_MESSAGES);
+    }
+
+    userMessages = userMessages.map((m) => ({
       role: m.role === 'assistant' ? 'assistant' : 'user',
-      content: String(m.content || '').slice(0, 2000)
+      content: String(m.content || '').slice(0, MAX_MESSAGE_CHARS)
     }));
   } catch (e) {
     return reply(400, { error: 'invalid_json' }, allowOrigin);
   }
 
-  // Format OpenAI : system prompt en 1er message avec role "system"
-  const messages = [
-    { role: 'system', content: SYSTEM_PROMPT },
-    ...userMessages
-  ];
+  const contents = toGeminiContents(userMessages);
+
+  const errors = [];
+
+  for (const model of MODELS) {
+    for (let attempt = 0; attempt <= MAX_RETRIES_PER_MODEL; attempt++) {
+      try {
+        const result = await callGemini({
+          apiKey,
+          model,
+          contents,
+          systemPrompt: SYSTEM_PROMPT
+        });
+
+        if (result.ok && result.text) {
+          console.log(`Gemini success with model=${model} attempt=${attempt + 1}`);
+          return reply(
+            200,
+            {
+              reply: result.text,
+              model
+            },
+            allowOrigin
+          );
+        }
+
+        errors.push({
+          model,
+          attempt: attempt + 1,
+          status: result.status,
+          error: result.error
+        });
+
+        console.warn(
+          `Gemini failed model=${model} attempt=${attempt + 1} status=${result.status} error=${result.error}`
+        );
+
+        if (!shouldRetry(result.status)) {
+          break;
+        }
+
+        if (attempt < MAX_RETRIES_PER_MODEL) {
+          await sleep(backoffDelay(attempt));
+        }
+      } catch (err) {
+        const message = err?.message || 'unknown_error';
+
+        errors.push({
+          model,
+          attempt: attempt + 1,
+          status: 0,
+          error: message
+        });
+
+        console.warn(
+          `Gemini exception model=${model} attempt=${attempt + 1} error=${message}`
+        );
+
+        if (attempt < MAX_RETRIES_PER_MODEL) {
+          await sleep(backoffDelay(attempt));
+          continue;
+        }
+      }
+    }
+  }
+
+  console.error('All Gemini models failed', JSON.stringify(errors));
+
+  const authOrQuotaFailure = errors.some((e) =>
+    [400, 401, 403, 429].includes(e.status)
+  );
+
+  return reply(
+    authOrQuotaFailure ? 429 : 503,
+    {
+      error: authOrQuotaFailure ? 'quota_or_auth' : 'unavailable',
+      details: errors.slice(-10)
+    },
+    allowOrigin
+  );
+};
+
+async function callGemini({ apiKey, model, contents, systemPrompt }) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
   try {
-    const apiRes = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${apiKey}`
-      },
-      body: JSON.stringify({
-        model: MODEL,
-        messages: messages,
-        max_tokens: 400,
-        temperature: 0.4
-      })
-    });
+    const res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        signal: controller.signal,
+        body: JSON.stringify({
+          systemInstruction: {
+            parts: [{ text: systemPrompt }]
+          },
+          contents,
+          generationConfig: {
+            temperature: TEMPERATURE,
+            maxOutputTokens: MAX_OUTPUT_TOKENS
+          }
+        })
+      }
+    );
 
-    // Codes "plus de crédit" / quota / auth => fallback email côté front
-    if ([401, 402, 429].includes(apiRes.status)) {
-      const errBody = await apiRes.text();
-      console.warn('OpenAI credit/quota error:', apiRes.status, errBody);
-      return reply(apiRes.status, { error: 'quota_or_auth' }, allowOrigin);
+    const rawText = await res.text();
+    let data = null;
+
+    try {
+      data = rawText ? JSON.parse(rawText) : null;
+    } catch (e) {
+      data = null;
     }
 
-    if (!apiRes.ok) {
-      const errBody = await apiRes.text();
-      console.error('OpenAI API error:', apiRes.status, errBody);
-      return reply(503, { error: 'api_error' }, allowOrigin);
+    if (!res.ok) {
+      return {
+        ok: false,
+        status: res.status,
+        error: extractApiError(data) || rawText || 'api_error'
+      };
     }
 
-    const data = await apiRes.json();
-    const text = data.choices?.[0]?.message?.content || '';
+    const text = extractCandidateText(data);
+
     if (!text) {
-      console.error('Empty response from OpenAI:', JSON.stringify(data));
-      return reply(503, { error: 'empty_response' }, allowOrigin);
+      return {
+        ok: false,
+        status: 503,
+        error: 'empty_response'
+      };
     }
 
-    return reply(200, { reply: text }, allowOrigin);
+    return {
+      ok: true,
+      status: 200,
+      text
+    };
   } catch (err) {
-    console.error('Function error:', err.message);
-    return reply(503, { error: 'unavailable' }, allowOrigin);
+    if (err.name === 'AbortError') {
+      return {
+        ok: false,
+        status: 408,
+        error: 'timeout'
+      };
+    }
+
+    return {
+      ok: false,
+      status: 0,
+      error: err.message || 'network_error'
+    };
+  } finally {
+    clearTimeout(timeout);
   }
-};
+}
+
+function toGeminiContents(messages) {
+  return messages.map((m) => ({
+    role: m.role === 'assistant' ? 'model' : 'user',
+    parts: [{ text: m.content }]
+  }));
+}
+
+function extractCandidateText(data) {
+  const parts = data?.candidates?.[0]?.content?.parts;
+  if (!Array.isArray(parts)) return '';
+
+  return parts
+    .map((p) => (typeof p?.text === 'string' ? p.text : ''))
+    .join('')
+    .trim();
+}
+
+function extractApiError(data) {
+  return (
+    data?.error?.message ||
+    data?.error?.status ||
+    data?.error?.code ||
+    ''
+  );
+}
+
+function shouldRetry(status) {
+  return [0, 408, 429, 500, 502, 503, 504].includes(status);
+}
+
+function backoffDelay(attempt) {
+  return RETRY_BASE_DELAY_MS * Math.pow(2, attempt);
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 function reply(statusCode, body, origin) {
   return {
