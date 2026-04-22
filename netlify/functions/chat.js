@@ -37,7 +37,7 @@ PRODUIT :
 - Filtres : maison/appartement, classes DPE F et G, rayon personnalisable
 
 DONNÉES :
-- Source : DPE officiels ADEME (open data)
+- Source : DPE officiels ADEME
 - Conformité RGPD : adresses publiques, base légale = intérêt légitime
 - Couverture : 96 départements France métropolitaine
 
