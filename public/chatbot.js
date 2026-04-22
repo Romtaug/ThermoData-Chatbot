@@ -222,7 +222,7 @@
         <div class="td-avatar">🤖</div>
         <div class="td-header-info">
           <p class="td-header-name">${CONFIG.botName}</p>
-          <p class="td-header-status"><span class="td-status-dot"></span>En ligne · répond en quelques secondes</p>
+          <p class="td-header-status"><span class="td-status-dot"></span>En ligne · réponse en quelques secondes · 24h/24, 7j/7</p>
         </div>
         <button class="td-close" aria-label="Fermer le chat">
           <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M19 6.4L17.6 5 12 10.6 6.4 5 5 6.4 10.6 12 5 17.6 6.4 19 12 13.4 17.6 19 19 17.6 13.4 12z"/></svg>
