@@ -23,7 +23,52 @@
      RATE_LIMIT_MAX        requêtes par IP et par minute (défaut 20)
    ========================================================================= */
 
-const { bestMatches } = require("./_retrieval");
+// ── Recherche dans la base de connaissance (BM25 léger, intégré) ────────────
+// Intégrée ici volontairement : chat.js ne dépend d'aucun autre fichier.
+const STOPWORDS = new Set(("a au aux avec ce ces cet cette d de des du elle en est et il ils je l la le les leur lui ma mais me mes mon n ne nos notre nous on ou par pas pour qu que quel quelle quels qui sa se ses si son sur ta te tes ton tu un une vos votre vous y c s t m j " +
+  "comment combien pourquoi quoi est-ce ca peut puis-je avez etes sont fait faire").split(/\s+/));
+function stem(t) {
+  if (t.length > 4 && /aux$/.test(t)) return t.slice(0, -1);
+  if (t.length > 3 && /[sx]$/.test(t)) return t.slice(0, -1);
+  return t;
+}
+function tokenize(text) {
+  return String(text || "").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9'\s-]/g, " ").split(/[\s'-]+/)
+    .filter((t) => t.length >= 2 && !STOPWORDS.has(t)).map(stem);
+}
+let INDEX = null;
+function buildIndex(items) {
+  const docs = items.map((a) => {
+    const tf = new Map();
+    const title = tokenize(a.title + " " + (a.category || "") + " " + (a.tags || ""));
+    const body = tokenize(a.content);
+    for (const t of title) tf.set(t, (tf.get(t) || 0) + 3);
+    for (const t of body) tf.set(t, (tf.get(t) || 0) + 1);
+    return { tf, len: title.length * 3 + body.length };
+  });
+  const df = new Map();
+  for (const d of docs) for (const t of d.tf.keys()) df.set(t, (df.get(t) || 0) + 1);
+  const N = docs.length;
+  const idf = new Map([...df].map(([t, n]) => [t, Math.log(1 + (N - n + 0.5) / (n + 0.5))]));
+  const avgdl = docs.reduce((s, d) => s + d.len, 0) / Math.max(N, 1);
+  return { docs, idf, avgdl };
+}
+function bestMatches(query, items, k = 3) {
+  if (!INDEX) INDEX = buildIndex(items);
+  const q = tokenize(query);
+  if (!q.length) return [];
+  const { docs, idf, avgdl } = INDEX;
+  return docs.map((d, i) => {
+    let s = 0;
+    for (const t of q) {
+      const f = d.tf.get(t);
+      if (!f) continue;
+      s += (idf.get(t) || 0) * (f * 2.5) / (f + 1.5 * (0.25 + 0.75 * d.len / avgdl));
+    }
+    return { article: items[i], score: s };
+  }).sort((a, b) => b.score - a.score).slice(0, k);
+}
 
 // ── Origines autorisées ─────────────────────────────────────────────────────
 const BUILTIN_ORIGINS = [
@@ -67,37 +112,37 @@ const CONTACT_EMAIL = "contact@thermodata.fr";
 // Sert à 3 choses : le prompt de l'IA, les relances / suggestions, et la
 // réponse de secours si l'IA ne répond pas. À tenir aligné avec le site.
 const KB = [
-  { category: "Offres", title: "Quelles sont vos offres ?",
+  { category: "Offres", title: "Quelles sont vos offres ?", tags: "tarifs prix coût coûte coûter payer cher formules abonnement",
     content: "Trois offres, sans abonnement caché : Découverte à 49€ pour 50 adresses, idéale pour tester une zone ; Pro à 99€ pour 200 adresses, le meilleur rapport qualité-prix ; et Accès à vie à 499€ en illimité sur 96 départements, avec 12 mois de mises à jour." },
-  { category: "Offres", title: "Quelle offre choisir ?",
+  { category: "Offres", title: "Quelle offre choisir ?", tags: "recommander conseiller meilleure formule",
     content: "Pour tester une zone, l'offre Découverte suffit. Pour une prospection régulière, l'offre Pro est la plus adaptée : 200 adresses, tournée 2-Opt avancée, filtre maison ou appartement et rayon personnalisable. Si vous prospectez beaucoup ou sur plusieurs secteurs, l'Accès à vie à 499€ devient le plus rentable." },
-  { category: "Offres", title: "Que contient l'offre Accès à vie ?",
+  { category: "Offres", title: "Que contient l'offre Accès à vie ?", tags: "illimité 499",
     content: "L'Accès à vie à 499€ donne des générations illimitées en usage interne, sur les 96 départements et toutes les classes DPE, avec 12 mois de mises à jour incluses et un support email prioritaire." },
-  { category: "Offres", title: "Que contiennent les offres Découverte et Pro ?",
+  { category: "Offres", title: "Que contiennent les offres Découverte et Pro ?", tags: "49 99 différence",
     content: "Découverte (49€) : 50 adresses certifiées BAN, score et priorité par prospect, tournée GPS optimisée, carte interactive et 6 onglets Excel. Pro (99€) : 200 adresses avec tout cela, plus la tournée 2-Opt avancée, le filtre maison ou appartement et un rayon personnalisable." },
-  { category: "Produit", title: "Comment ça marche ?",
+  { category: "Produit", title: "Comment ça marche ?", tags: "fonctionnement étapes utiliser",
     content: "Vous saisissez votre adresse d'artisan, ThermoData charge la base DPE officielle de l'ADEME, filtre selon vos critères (classe DPE, type de bien, énergie de chauffage, rayon), garde uniquement les adresses fiables, calcule un score commercial et optimise votre tournée. Vous obtenez une carte interactive et un Excel complet en moins de 30 secondes." },
-  { category: "Données", title: "D'où viennent vos données ?",
+  { category: "Données", title: "D'où viennent vos données ?", tags: "source provenance ADEME",
     content: "Les données proviennent de la base DPE officielle publiée par l'ADEME (Licence Etalab v2.0), croisée avec la Base Adresse Nationale (BAN) pour garantir la fiabilité des adresses. ThermoData structure et enrichit ces données pour les rendre directement actionnables." },
-  { category: "Produit", title: "Comment fonctionne le score commercial ?",
+  { category: "Produit", title: "Comment fonctionne le score commercial ?", tags: "note priorité points",
     content: "Le score de 0 à 100 combine 6 critères issus du DPE : classe énergétique (G = 35 points, F = 22, E = 10), énergie de chauffage (fioul = 25 points, charbon = 20, GPL = 18), surface habitable, ancienneté, qualité de l'isolation et coût énergétique annuel. Plus le score est élevé, plus le prospect est prioritaire." },
-  { category: "Données", title: "Les adresses sont-elles fiables ?",
+  { category: "Données", title: "Les adresses sont-elles fiables ?", tags: "fiabilité exactes erreurs introuvables",
     content: "Oui. Quatre filtres cumulatifs sur les champs BAN du fichier ADEME : géocodage à l'adresse exacte, numéro de voie présent, score de confiance BAN d'au moins 0,60 et adresse normalisée. Les adresses imprécises sont exclues : zéro adresse introuvable dans Google Maps ou Waze." },
-  { category: "Produit", title: "Comment est optimisée la tournée ?",
+  { category: "Produit", title: "Comment est optimisée la tournée ?", tags: "itinéraire trajet kilomètres GPS",
     content: "Deux algorithmes combinés : le Nearest-Neighbor construit la tournée en allant toujours au point le plus proche, puis le 2-Opt l'optimise. Résultat : 5 à 20% de distance économisée, soit 3 à 8 km de moins sur 50 portes, avec un lien Google Maps compatible Waze." },
-  { category: "Produit", title: "Que contient le fichier Excel ?",
+  { category: "Produit", title: "Que contient le fichier Excel ?", tags: "livrable onglets export",
     content: "6 onglets aux couleurs DPE : Prospection (liste triée avec liens Maps et Waze), Dashboard (indicateurs), Analyses (répartitions DPE, énergie, isolation), Guide terrain (scripts de vente, aides) et Lexique (méthodologie, sources). Un livrable prêt à utiliser immédiatement." },
-  { category: "Produit", title: "Les économies estimées sont-elles fiables ?",
+  { category: "Produit", title: "Les économies estimées sont-elles fiables ?", tags: "économie estimation argument",
     content: "Ce sont des outils d'argumentation terrain, pas une garantie. La formule utilise le coût des 5 usages multiplié par un taux de réduction selon la classe DPE (G = 55%, F = 40%, E = 25%). L'écart typique est de plus ou moins 20 à 30% selon les travaux : le devis de l'artisan prime toujours." },
-  { category: "Données", title: "Est-ce conforme au RGPD ?",
+  { category: "Données", title: "Est-ce conforme au RGPD ?", tags: "légal légalité droit données personnelles",
     content: "Oui. Les données viennent des DPE officiels de l'ADEME et portent sur des adresses publiques. L'utilisation repose sur l'intérêt légitime (article 6.1.f du RGPD), dans un cadre de prospection professionnelle." },
-  { category: "Données", title: "Quelle zone couvrez-vous ?",
+  { category: "Données", title: "Quelle zone couvrez-vous ?", tags: "couverture départements France région",
     content: "ThermoData couvre les 96 départements de France métropolitaine. Le marché est large : depuis janvier 2025, les logements classés G sont interdits à la location, et on compte environ 4,8 millions de résidences principales en passoire thermique (F et G)." },
-  { category: "Partenariat", title: "Puis-je revendre des plans à mes artisans clients ?",
+  { category: "Partenariat", title: "Puis-je revendre des plans à mes artisans clients ?", tags: "revendeur revente partenariat",
     content: "Oui, ThermoData est conçu pour ce modèle : vous achetez l'accès, générez des plans pour chaque artisan client et les facturez à l'unité ou à l'abonnement. Un tarif revendeur dégressif existe : écrivez à contact@thermodata.fr pour les conditions de partenariat." },
-  { category: "Contact", title: "Comment vous contacter ?",
+  { category: "Contact", title: "Comment vous contacter ?", tags: "joindre email téléphone humain",
     content: "Écrivez à contact@thermodata.fr, ou utilisez le bouton « Nous contacter » de la page. Réponse sous 24h. ThermoData est basé à Lyon." },
-  { category: "Produit", title: "Peut-on voir une démo ?",
+  { category: "Produit", title: "Peut-on voir une démo ?", tags: "démonstration vidéo exemple essai",
     content: "Oui : la section Démo du site montre tout le parcours, de la saisie de l'adresse à l'Excel complet, en moins de 30 secondes. Vous pouvez aussi voir un exemple de fichier Excel et accéder directement à l'interface." },
 ];
 
@@ -269,8 +314,8 @@ function followUps(messages, replyText) {
   const users = messages.filter((m) => m.role === "user").map((m) => m.content);
   const lastUser = users[users.length - 1] || "";
   const asked = new Set(users.map(fold));
-  const answered = (bestMatches(lastUser, KB_ITEMS, 1, "kb")[0] || {}).article || null;
-  const pool = bestMatches(lastUser + " " + replyText, KB_ITEMS, 10, "kb")
+  const answered = (bestMatches(lastUser, KB_ITEMS, 1)[0] || {}).article || null;
+  const pool = bestMatches(lastUser + " " + replyText, KB_ITEMS, 10)
     .filter((x) => x.score > 0 && x.article !== answered && !asked.has(fold(x.article.title)) && fold(x.article.category) !== "contact")
     .map((x) => x.article.title);
   for (const d of ["Quelles sont vos offres ?", "Comment ça marche ?", "D'où viennent vos données ?", "Quelle offre choisir ?"]) {
@@ -285,8 +330,8 @@ function followUps(messages, replyText) {
 
 function kbFallback(messages) {
   const users = messages.filter((m) => m.role === "user").map((m) => m.content);
-  let r = bestMatches(users[users.length - 1] || "", KB_ITEMS, 1, "kb");
-  if (!r.length || r[0].score <= 0) r = bestMatches(users.slice(-2).join(" "), KB_ITEMS, 1, "kb");
+  let r = bestMatches(users[users.length - 1] || "", KB_ITEMS, 1);
+  if (!r.length || r[0].score <= 0) r = bestMatches(users.slice(-2).join(" "), KB_ITEMS, 1);
   return r.length && r[0].score > 0 ? r[0].article.content : null;
 }
 
@@ -350,4 +395,4 @@ exports.handler = async (event) => {
   return reply(200, { reply: text, relance: f.relance, suggestions: f.suggestions, cta: model === "fallback" ? "contact" : f.cta, model, degraded, diag }, origin);
 };
 
-exports._internals = { cleanReply, followUps, kbFallback, isOriginAllowed, KB };
+exports._internals = { cleanReply, followUps, kbFallback, isOriginAllowed, KB, bestMatches };
