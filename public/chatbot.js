@@ -50,7 +50,7 @@
 
   const CONFIG = {
     title: 'Assistant ThermoData',
-    welcome: "Bonjour 👋 Je suis l'assistant ThermoData. Posez-moi vos questions sur nos offres, nos données DPE ou la prospection RGE !",
+    welcome: "Bonjour 👋 Je suis l'assistant ThermoData. Posez-moi vos questions sur nos offres, nos données DPE, la prospection RGE ou la création de votre site internet !",
     placeholder: 'Votre message...',
     brand: brand,
     brandDark: '#D85A30',
@@ -62,9 +62,9 @@
     teaser: '',
     teaserDelay: 12000,
     // Sections de thermodata.fr vers lesquelles mènent les boutons d'action
-    sections: { pricing: '#pricing', demo: '#demo', contact: '#contact' }
+    sections: { pricing: '#pricing', demo: '#demo', contact: '#contact', site: '#creation-site' }
   };
-  const startQuestions = ['Quelles sont vos offres ?', "D'où viennent vos données ?", 'Comment ça marche ?'];
+  const startQuestions = ['Quelles sont vos offres ?', 'Créez-vous aussi des sites internet ?', "D'où viennent vos données ?", 'Comment ça marche ?'];
   const ENDPOINT = SERVICE_BASE_URL + '/.netlify/functions/chat';
   const PRIMARY = { type: 'mail', value: CONTACT_EMAIL, display: CONTACT_EMAIL };
   const TU = false;
@@ -440,7 +440,7 @@
       b.addEventListener('click', function () { ask(q); });
       quickEl.appendChild(b);
     });
-    const CTA_LABELS = { pricing: 'Voir les tarifs →', demo: 'Voir la démo →', contact: 'Nous contacter →' };
+    const CTA_LABELS = { pricing: 'Voir les tarifs →', demo: 'Voir la démo →', contact: 'Nous contacter →', site: 'Demander mon site →' };
     if (CTA_LABELS[cta]) {
       const a = document.createElement('button');
       a.type = 'button'; a.className = 'tdc-chip tdc-cta'; a.textContent = CTA_LABELS[cta];
