@@ -440,7 +440,7 @@
       b.addEventListener('click', function () { ask(q); });
       quickEl.appendChild(b);
     });
-    const CTA_LABELS = { pricing: 'Voir les tarifs →', demo: 'Voir la démo →', contact: 'Nous contacter →', site: 'Demander mon site →' };
+    const CTA_LABELS = { pricing: 'Voir les tarifs →', demo: 'Voir la démo →', contact: 'Nous contacter →', site: 'Commander mon site →' };
     if (CTA_LABELS[cta]) {
       const a = document.createElement('button');
       a.type = 'button'; a.className = 'tdc-chip tdc-cta'; a.textContent = CTA_LABELS[cta];
